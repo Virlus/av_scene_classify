@@ -11,8 +11,9 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import seaborn as sn
 
-from dataset import SceneDataset 
+from dataset import SceneDataset
 import models
+torch.multiprocessing.set_sharing_strategy('file_system')
 
 parser = argparse.ArgumentParser(description='evaluation')
 parser.add_argument('--experiment_path', type=str, required=True)
@@ -29,35 +30,30 @@ std_audio = mean_std_audio["global_std"]
 mean_video = mean_std_video["global_mean"]
 std_video = mean_std_video["global_std"]
 
-audio_transform = lambda x: (x - mean_audio / std_audio)
-video_transform = lambda x: (x - mean_video / std_video)
+audio_transform = lambda x: (x - mean_audio) / std_audio
+video_transform = lambda x: (x - mean_video) / std_video
 
 tt_ds = SceneDataset(config["data"]["test"]["audio_feature"],
                      config["data"]["test"]["video_feature"],
                      audio_transform,
                      video_transform)
 config["data"]["dataloader_args"]["batch_size"] = 1
-tt_dataloader = DataLoader(tt_ds, shuffle=True, **config["data"]["dataloader_args"])
+tt_dataloader = DataLoader(tt_ds, shuffle=False, **config["data"]["dataloader_args"])
 
-model_combine = models.l3_combine(256, config["num_classes"])
-model_audio = models.l3_dense(512, config["num_classes"])
-model_video = models.l3_dense(512, config["num_classes"])
+model = models.MeanConcatDense(512, 512, config["num_classes"])
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-model_combine.load_state_dict(torch.load(
+model.load_state_dict(torch.load(
     os.path.join(args.experiment_path, "best_model.pt"), "cpu")
 )
-model_audio.load_state_dict(torch.load(config["audio_model_ckpt"], "cpu"))
-model_video.load_state_dict(torch.load(config["video_model_ckpt"], "cpu"))
 
-model_combine = model_combine.to(device).eval()
-model_audio = model_audio.to(device).eval()
-model_video = model_video.to(device).eval()
+model = model.to(device).eval()
 
 targets = []
 probs = []
 preds = []
+aids = []
 
 with torch.no_grad():
     tt_dataloader = tqdm(tt_dataloader)
@@ -65,25 +61,18 @@ with torch.no_grad():
         audio_feat = batch["audio_feat"].to(device)
         video_feat = batch["video_feat"].to(device)
         target = batch["target"].to(device)
-        audio_emb = audio_feat.mean(1)
-        video_emb = video_feat.mean(1)
-        modulelist_audio = list(model_audio.model)
-        modulelist_video = list(model_video.model)
-        for l in modulelist_audio[:5]:
-            audio_emb = l(audio_emb)
-        for l in modulelist_video[:5]:
-            video_emb = l(video_emb)
-        embed = torch.cat((audio_emb, video_emb), 1).to(device)
-        logit = model_combine(embed)
+        logit = model(audio_feat, video_feat)
         pred = torch.argmax(logit, 1)
         targets.append(target.cpu().numpy())
         probs.append(torch.softmax(logit, 1).cpu().numpy())
         preds.append(pred.cpu().numpy())
+        aids.append(np.array(batch["aid"]))
 
 
 targets = np.concatenate(targets, axis=0)
 preds = np.concatenate(preds, axis=0)
 probs = np.concatenate(probs, axis=0)
+aids = np.concatenate(aids, axis=0)
 
 writer = open(os.path.join(args.experiment_path, "result.txt"), "w")
 cm = confusion_matrix(targets, preds)
@@ -97,10 +86,22 @@ keys = ['airport',
         'street_pedestrian',
         'street_traffic',
         'tram']
+
+scenes_pred = [keys[pred] for pred in preds]
+scenes_label = [keys[target] for target in targets]
+pred_dict = {"aid": aids, "scene_pred": scenes_pred, "scene_label": scenes_label}
+for idx, key in enumerate(keys):
+    pred_dict[key] = probs[:, idx]
+pd.DataFrame(pred_dict).to_csv(os.path.join(args.experiment_path, "prediction.csv"),
+                               index=False,
+                               sep="\t",
+                               float_format="%.3f")
+
+
 print(classification_report(targets, preds, target_names=keys), file=writer)
 
 df_cm = pd.DataFrame(cm.astype('float') / cm.sum(axis=1)[:, np.newaxis],
-    index=keys, columns=keys)
+                     index=keys, columns=keys)
 plt.figure(figsize=(15, 12))
 sn.heatmap(df_cm, annot=True)
 plt.savefig(os.path.join(args.experiment_path, 'cm.png'))

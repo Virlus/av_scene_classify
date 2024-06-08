@@ -13,7 +13,6 @@ from sklearn.metrics import accuracy_score
 import torch
 from torch.utils.data import DataLoader
 import torch.optim as optim
-from torch.utils.tensorboard import SummaryWriter
 
 from dataset import SceneDataset 
 import models
@@ -44,8 +43,8 @@ mean_std_video = np.load(config["data"]["video_norm"])
 mean_video = mean_std_video["global_mean"]
 std_video = mean_std_video["global_std"]
 
-audio_transform = lambda x: (x - mean_audio / std_audio)
-video_transform = lambda x: (x - mean_video / std_video)
+audio_transform = lambda x: (x - mean_audio) / std_audio
+video_transform = lambda x: (x - mean_video) / std_video
 
 tr_ds = SceneDataset(config["data"]["train"]["audio_feature"],
                      config["data"]["train"]["video_feature"],
@@ -59,27 +58,20 @@ cv_ds = SceneDataset(config["data"]["cv"]["audio_feature"],
                      video_transform)
 cv_dataloader = DataLoader(cv_ds, shuffle=False, **config["data"]["dataloader_args"])
 
-model_combine = models.l3_combine(256, config["num_classes"])
-model_audio = models.l3_dense(512, config["num_classes"])
-model_video = models.l3_dense(512, config["num_classes"])
-print(model_combine)
+model = models.MeanConcatDense(512, 512, config["num_classes"])
+print(model)
 
 output_dir = config["output_dir"]
 Path(output_dir).mkdir(exist_ok=True, parents=True)
 logging_writer = utils.getfile_outlogger(os.path.join(output_dir, "train.log"))
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model_audio.load_state_dict(torch.load(config["audio_model_ckpt"], "cpu"))
-model_audio = model_audio.to(device)
-model_video.load_state_dict(torch.load(config["video_model_ckpt"], "cpu"))
-model_video = model_video.to(device)
-model_audio.eval()
-model_video.eval()
+model = model.to(device)
 
 loss_fn = torch.nn.CrossEntropyLoss()
 
 optimizer = getattr(optim, config["optimizer"]["type"])(
-    model_combine.parameters(),
+    model.parameters(),
     **config["optimizer"]["args"])
 
 lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
@@ -88,8 +80,8 @@ lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer,
 print('-----------start training-----------')
 
 
-def train(epoch, writer):
-    model_combine.train()
+def train(epoch):
+    model.train()
     train_loss = 0.
     start_time = time.time()
     count = len(tr_dataloader) * (epoch - 1)
@@ -103,18 +95,7 @@ def train(epoch, writer):
         # training
         optimizer.zero_grad()
 
-        with torch.no_grad():
-            audio_emb = audio_feat.mean(1)
-            video_emb = video_feat.mean(1)
-            modulelist_audio = list(model_audio.model)
-            modulelist_video = list(model_video.model)
-            for l in modulelist_audio[:5]:
-                audio_emb = l(audio_emb)
-            for l in modulelist_video[:5]:
-                video_emb = l(video_emb)
-
-        embed = torch.cat((audio_emb, video_emb), 1).to(device)
-        logit = model_combine(embed)
+        logit = model(audio_feat, video_feat)
         loss = loss_fn(logit, target)
         loss.backward()
 
@@ -123,8 +104,6 @@ def train(epoch, writer):
 
         if (batch_idx + 1) % 100 == 0:
             elapsed = time.time() - start_time
-            writer.add_scalar('Loss/train', loss.item(), count)
-            writer.add_scalar('Loss/train_avg', train_loss / (batch_idx + 1), count)
             print('| epoch {:3d} | {:5d}/{:5d} batches | ms/batch {:5.2f} | loss {:5.2f} |'.format(
                 epoch, batch_idx + 1, len(tr_dataloader),
                 elapsed * 1000 / (batch_idx + 1), loss.item()))
@@ -135,9 +114,8 @@ def train(epoch, writer):
         epoch, (time.time() - start_time), train_loss))
     return train_loss
 
-def validate(epoch, writer):
-    model_combine.eval()
-    validation_loss = 0.
+def validate(epoch):
+    model.eval()
     start_time = time.time()
     # data loading
     cv_loss = 0.
@@ -148,25 +126,14 @@ def validate(epoch, writer):
             audio_feat = batch["audio_feat"].to(device)
             video_feat = batch["video_feat"].to(device)
             target = batch["target"].to(device)
-            audio_emb = audio_feat.mean(1)
-            video_emb = video_feat.mean(1)
-            modulelist_audio = list(model_audio.model)
-            modulelist_video = list(model_video.model)
-            for l in modulelist_audio[:5]:
-                audio_emb = l(audio_emb)
-            for l in modulelist_video[:5]:
-                video_emb = l(video_emb)
-            embed = torch.cat((audio_emb, video_emb), 1).to(device)
-            logit = model_combine(embed)
+            logit = model(audio_feat, video_feat)
             loss = loss_fn(logit, target)
             pred = torch.argmax(logit, 1)
             targets.append(target.cpu().numpy())
             preds.append(pred.cpu().numpy())
             cv_loss += loss.item()
 
-    cv_loss /= (batch_idx+1)
-    writer.add_scalar('Loss/val', loss.item(), batch_idx * epoch)
-    writer.add_scalar('Loss/val_avg', validation_loss, batch_idx * epoch)
+    cv_loss /= (batch_idx + 1)
     preds = np.concatenate(preds, axis=0)
     targets = np.concatenate(targets, axis=0)
     accuracy = accuracy_score(targets, preds)
@@ -179,26 +146,25 @@ def validate(epoch, writer):
 
 training_loss = []
 cv_loss = []
-writer_tr = SummaryWriter(os.path.join(output_dir, 'train'))
-writer_cv = SummaryWriter(os.path.join(output_dir, 'cv'))
+
 
 with open(os.path.join(output_dir, 'config.yaml'), "w") as writer:
     yaml.dump(config, writer, default_flow_style=False)
 
 not_improve_cnt = 0
 for epoch in range(1, config["epoch"]):
-    model_combine.cuda()
     print('epoch', epoch)
-    training_loss.append(train(epoch, writer_tr))
-    cv_loss.append(validate(epoch, writer_cv))
+    training_loss.append(train(epoch))
+    cv_loss.append(validate(epoch))
     print('-' * 99)
     print('epoch', epoch, 'training loss: ', training_loss[-1], 'cv loss: ', cv_loss[-1])
 
     if cv_loss[-1] == np.min(cv_loss):
         # save current best model
-        torch.save(model_combine.state_dict(), os.path.join(output_dir, 'best_model.pt'))
+        torch.save(model.state_dict(), os.path.join(output_dir, 'best_model.pt'))
         print('best validation model found and saved.')
         print('-' * 99)
+        not_improve_cnt = 0
     else:
         not_improve_cnt += 1
     
